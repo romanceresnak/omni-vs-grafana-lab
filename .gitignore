@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+incident/timeline.log
+incident/.answer
+.omni-lab-ip
