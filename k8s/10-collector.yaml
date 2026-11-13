@@ -1,0 +1,189 @@
+# OpenTelemetry Collector: ONE input, TWO worlds.
+#   traces  -> Tempo                 + CloudWatch OTLP (xray)       [+ spanmetrics/servicegraph for Grafana]
+#   metrics -> Prometheus (remote wr) + CloudWatch OTLP (monitoring)
+#   logs    -> Loki (OTLP)           + CloudWatch OTLP (logs)
+# ${REGION} and ${LOG_GROUP} are filled in by scripts/render.py.
+# ServiceAccount "otel-collector" is created by eksctl (IRSA), not here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector
+  namespace: observability
+data:
+  config.yaml: |
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+      sigv4auth/traces:
+        region: ${REGION}
+        service: xray
+      sigv4auth/logs:
+        region: ${REGION}
+        service: logs
+      sigv4auth/metrics:
+        region: ${REGION}
+        service: monitoring
+
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+
+    processors:
+      memory_limiter:
+        check_interval: 1s
+        limit_percentage: 80
+        spike_limit_percentage: 25
+      batch:
+        send_batch_size: 500
+        timeout: 5s
+      # only on the Grafana-metrics branch: make service.version a span attribute
+      # so spanmetrics can use it as a label (spans sent to Tempo/CloudWatch stay untouched)
+      transform/version:
+        error_mode: ignore
+        trace_statements:
+          - set(span.attributes["service.version"], resource.attributes["service.version"])
+
+    connectors:
+      # RED metrics for the Grafana side (Omni gets its own from the CloudWatch plugin)
+      span_metrics:
+        namespace: lab.spanmetrics
+        histogram:
+          explicit:
+            buckets: [25ms, 50ms, 100ms, 250ms, 500ms, 800ms, 1s, 2s, 5s]
+        dimensions:
+          - name: tenant.id
+          - name: service.version
+          - name: http.response.status_code
+        metrics_flush_interval: 15s
+      # service map for Grafana (Tempo data source -> Service graph)
+      service_graph:
+        latency_histogram_buckets: [25ms, 50ms, 100ms, 250ms, 500ms, 800ms, 1s, 2s, 5s]
+        metrics_flush_interval: 15s
+        store:
+          ttl: 5s
+          max_items: 5000
+
+    exporters:
+      debug:
+        verbosity: basic
+      # --- Grafana world ---
+      otlp_grpc/tempo:
+        endpoint: tempo.observability.svc.cluster.local:4317
+        tls:
+          insecure: true
+      otlp_http/loki:
+        endpoint: http://loki.observability.svc.cluster.local:3100/otlp
+      prometheus_remote_write:
+        endpoint: http://prometheus.observability.svc.cluster.local:9090/api/v1/write
+        resource_to_telemetry_conversion:
+          enabled: true
+      # second writer for the derived metrics; target_info off, otherwise both writers
+      # send the same target_info series and Prometheus rejects the batch (out of order sample)
+      prometheus_remote_write/derived:
+        endpoint: http://prometheus.observability.svc.cluster.local:9090/api/v1/write
+        resource_to_telemetry_conversion:
+          enabled: true
+        target_info:
+          enabled: false
+      # --- CloudWatch / Omni world (SigV4, credentials from IRSA) ---
+      otlp_http/cw-traces:
+        traces_endpoint: https://xray.${REGION}.amazonaws.com/v1/traces
+        compression: gzip
+        auth:
+          authenticator: sigv4auth/traces
+      otlp_http/cw-logs:
+        logs_endpoint: https://logs.${REGION}.amazonaws.com/v1/logs
+        compression: gzip
+        headers:
+          x-aws-log-group: ${LOG_GROUP}
+          x-aws-log-stream: otel-collector
+        auth:
+          authenticator: sigv4auth/logs
+      otlp_http/cw-metrics:
+        metrics_endpoint: https://monitoring.${REGION}.amazonaws.com/v1/metrics
+        compression: gzip
+        auth:
+          authenticator: sigv4auth/metrics
+
+    service:
+      extensions: [health_check, sigv4auth/traces, sigv4auth/logs, sigv4auth/metrics]
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, batch]
+          exporters: [otlp_grpc/tempo, otlp_http/cw-traces]
+        traces/derived:
+          receivers: [otlp]
+          processors: [memory_limiter, transform/version, batch]
+          exporters: [span_metrics, service_graph]
+        metrics:
+          receivers: [otlp]
+          processors: [memory_limiter, batch]
+          exporters: [prometheus_remote_write, otlp_http/cw-metrics]
+        metrics/derived:
+          receivers: [span_metrics, service_graph]
+          processors: [batch]
+          exporters: [prometheus_remote_write/derived]
+        logs:
+          receivers: [otlp]
+          processors: [memory_limiter, batch]
+          exporters: [otlp_http/loki, otlp_http/cw-logs]
+      telemetry:
+        metrics:
+          readers:
+            - pull:
+                exporter:
+                  prometheus:
+                    host: 0.0.0.0
+                    port: 8888
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+  namespace: observability
+  labels: {app: otel-collector}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: otel-collector}
+  template:
+    metadata:
+      labels: {app: otel-collector}
+    spec:
+      serviceAccountName: otel-collector
+      containers:
+        - name: collector
+          image: otel/opentelemetry-collector-contrib:0.164.0
+          args: ["--config=/conf/config.yaml"]
+          ports:
+            - {name: otlp-grpc, containerPort: 4317}
+            - {name: otlp-http, containerPort: 4318}
+            - {name: metrics, containerPort: 8888}
+            - {name: health, containerPort: 13133}
+          readinessProbe:
+            httpGet: {path: /, port: 13133}
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {memory: 1Gi}
+          volumeMounts:
+            - {name: conf, mountPath: /conf}
+      volumes:
+        - name: conf
+          configMap: {name: otel-collector}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+  namespace: observability
+spec:
+  selector: {app: otel-collector}
+  ports:
+    - {name: otlp-grpc, port: 4317, targetPort: 4317}
+    - {name: otlp-http, port: 4318, targetPort: 4318}
+    - {name: metrics, port: 8888, targetPort: 8888}

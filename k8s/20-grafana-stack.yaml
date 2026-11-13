@@ -1,0 +1,361 @@
+# Self-hosted "Grafana world": Tempo, Loki, Prometheus, Grafana.
+# Single binaries, emptyDir storage. A lab, not production: a pod restart loses data.
+# ---------------------------------------------------------------- Tempo
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tempo
+  namespace: observability
+data:
+  tempo.yaml: |
+    stream_over_http_enabled: true
+    server:
+      http_listen_port: 3200
+    distributor:
+      receivers:
+        otlp:
+          protocols:
+            grpc:
+              endpoint: 0.0.0.0:4317
+            http:
+              endpoint: 0.0.0.0:4318
+    storage:
+      trace:
+        backend: local
+        local:
+          path: /var/tempo/traces
+        wal:
+          path: /var/tempo/wal
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tempo
+  namespace: observability
+  labels: {app: tempo}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: tempo}
+  template:
+    metadata:
+      labels: {app: tempo}
+    spec:
+      securityContext: {fsGroup: 10001, runAsUser: 10001, runAsGroup: 10001}
+      containers:
+        - name: tempo
+          image: grafana/tempo:2.8.2
+          args: ["-config.file=/conf/tempo.yaml"]
+          ports:
+            - {containerPort: 3200}
+            - {containerPort: 4317}
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {memory: 2Gi}
+          volumeMounts:
+            - {name: conf, mountPath: /conf}
+            - {name: data, mountPath: /var/tempo}
+      volumes:
+        - {name: conf, configMap: {name: tempo}}
+        - {name: data, emptyDir: {}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tempo
+  namespace: observability
+spec:
+  selector: {app: tempo}
+  ports:
+    - {name: http, port: 3200, targetPort: 3200}
+    - {name: otlp-grpc, port: 4317, targetPort: 4317}
+# ---------------------------------------------------------------- Loki
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loki
+  namespace: observability
+data:
+  loki.yaml: |
+    auth_enabled: false
+    server:
+      http_listen_port: 3100
+      grpc_listen_port: 9096
+    common:
+      instance_addr: 127.0.0.1
+      path_prefix: /loki
+      replication_factor: 1
+      ring:
+        kvstore:
+          store: inmemory
+      storage:
+        filesystem:
+          chunks_directory: /loki/chunks
+          rules_directory: /loki/rules
+    schema_config:
+      configs:
+        - from: "2024-01-01"
+          store: tsdb
+          object_store: filesystem
+          schema: v13
+          index:
+            prefix: index_
+            period: 24h
+    limits_config:
+      allow_structured_metadata: true
+      volume_enabled: true
+    pattern_ingester:
+      enabled: true
+    analytics:
+      reporting_enabled: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loki
+  namespace: observability
+  labels: {app: loki}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: loki}
+  template:
+    metadata:
+      labels: {app: loki}
+    spec:
+      securityContext: {fsGroup: 10001, runAsUser: 10001, runAsGroup: 10001}
+      containers:
+        - name: loki
+          image: grafana/loki:3.5.3
+          args: ["-config.file=/conf/loki.yaml"]
+          ports:
+            - {containerPort: 3100}
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {memory: 1Gi}
+          volumeMounts:
+            - {name: conf, mountPath: /conf}
+            - {name: data, mountPath: /loki}
+      volumes:
+        - {name: conf, configMap: {name: loki}}
+        - {name: data, emptyDir: {}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loki
+  namespace: observability
+spec:
+  selector: {app: loki}
+  ports:
+    - {name: http, port: 3100, targetPort: 3100}
+# ---------------------------------------------------------------- Prometheus
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus
+  namespace: observability
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+    rule_files:
+      - /etc/prometheus/rules.yml
+    scrape_configs:
+      - job_name: otel-collector
+        static_configs:
+          - targets: ["otel-collector.observability.svc.cluster.local:8888"]
+      - job_name: prometheus
+        static_configs:
+          - targets: ["localhost:9090"]
+  rules.yml: |
+    groups:
+      - name: shop-slo
+        rules:
+          # per tenant: one tenant at 20% errors is an incident even if the total is 5%
+          - alert: StorefrontErrorRateHigh
+            expr: |
+              sum by (tenant_id) (rate(lab_spanmetrics_calls_total{service_name="storefront", span_kind="SPAN_KIND_SERVER", status_code="STATUS_CODE_ERROR"}[2m]))
+                /
+              sum by (tenant_id) (rate(lab_spanmetrics_calls_total{service_name="storefront", span_kind="SPAN_KIND_SERVER"}[2m]))
+                > 0.05
+            for: 1m
+            labels: {severity: page}
+            annotations:
+              summary: "storefront error rate for {{ $labels.tenant_id }} above 5% for 1 minute"
+          - alert: StorefrontLatencyHigh
+            expr: |
+              histogram_quantile(0.95,
+                sum by (le) (rate(lab_spanmetrics_duration_milliseconds_bucket{service_name="storefront", span_kind="SPAN_KIND_SERVER"}[2m]))
+              ) > 800
+            for: 1m
+            labels: {severity: page}
+            annotations:
+              summary: "storefront p95 above 800 ms for 1 minute"
+      - name: pipeline
+        rules:
+          - alert: CollectorExportFailing
+            expr: |
+              sum by (exporter) (rate({__name__=~"otelcol_exporter_send_failed_(spans|log_records|metric_points)(_total)?"}[5m])) > 0
+            for: 2m
+            labels: {severity: warning}
+            annotations:
+              summary: "collector exporter {{ $labels.exporter }} is dropping data"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: observability
+  labels: {app: prometheus}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: prometheus}
+  template:
+    metadata:
+      labels: {app: prometheus}
+    spec:
+      securityContext: {fsGroup: 65534, runAsUser: 65534, runAsNonRoot: true}
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v3.5.0
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time=3d
+            - --web.enable-remote-write-receiver
+            - --web.enable-lifecycle
+          ports:
+            - {containerPort: 9090}
+          resources:
+            requests: {cpu: 100m, memory: 512Mi}
+            limits: {memory: 2Gi}
+          volumeMounts:
+            - {name: conf, mountPath: /etc/prometheus}
+            - {name: data, mountPath: /prometheus}
+      volumes:
+        - {name: conf, configMap: {name: prometheus}}
+        - {name: data, emptyDir: {}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: observability
+spec:
+  selector: {app: prometheus}
+  ports:
+    - {name: http, port: 9090, targetPort: 9090}
+# ---------------------------------------------------------------- Grafana
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  namespace: observability
+data:
+  datasources.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        uid: prom
+        access: proxy
+        url: http://prometheus.observability.svc.cluster.local:9090
+        isDefault: true
+      - name: Tempo
+        type: tempo
+        uid: tempo
+        access: proxy
+        url: http://tempo.observability.svc.cluster.local:3200
+        jsonData:
+          nodeGraph:
+            enabled: true
+          serviceMap:
+            datasourceUid: prom
+          tracesToLogsV2:
+            datasourceUid: loki
+            spanStartTimeShift: "-2m"
+            spanEndTimeShift: "2m"
+            filterByTraceID: true
+            filterBySpanID: false
+          tracesToMetrics:
+            datasourceUid: prom
+      - name: Loki
+        type: loki
+        uid: loki
+        access: proxy
+        url: http://loki.observability.svc.cluster.local:3100
+        jsonData:
+          derivedFields:
+            - name: trace_id
+              datasourceUid: tempo
+              matcherType: label
+              matcherRegex: trace_id
+              url: "$${__value.raw}"
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+      - name: lab
+        folder: Lab
+        type: file
+        options:
+          path: /var/lib/grafana/dashboards
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: observability
+  labels: {app: grafana}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: grafana}
+  template:
+    metadata:
+      labels: {app: grafana}
+    spec:
+      containers:
+        - name: grafana
+          image: grafana/grafana:12.1.1
+          env:
+            - name: GF_SECURITY_ADMIN_USER
+              value: admin
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: grafana-admin, key: password}
+            - {name: GF_AUTH_ANONYMOUS_ENABLED, value: "false"}
+            - {name: GF_ANALYTICS_REPORTING_ENABLED, value: "false"}
+          ports:
+            - {containerPort: 3000}
+          readinessProbe:
+            httpGet: {path: /api/health, port: 3000}
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {memory: 1Gi}
+          volumeMounts:
+            - {name: datasources, mountPath: /etc/grafana/provisioning/datasources/datasources.yaml, subPath: datasources.yaml}
+            - {name: datasources, mountPath: /etc/grafana/provisioning/dashboards/dashboards.yaml, subPath: dashboards.yaml}
+            - {name: dashboards, mountPath: /var/lib/grafana/dashboards}
+      volumes:
+        - {name: datasources, configMap: {name: grafana-datasources}}
+        - {name: dashboards, configMap: {name: grafana-dashboards}}
+---
+# Reachable ONLY from your own IP (loadBalancerSourceRanges). Never 0.0.0.0/0.
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: observability
+spec:
+  type: LoadBalancer
+  loadBalancerSourceRanges:
+    - ${MY_IP}/32
+  selector: {app: grafana}
+  ports:
+    - {name: http, port: 80, targetPort: 3000}

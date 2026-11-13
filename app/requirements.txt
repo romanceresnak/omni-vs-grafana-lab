@@ -1,0 +1,10 @@
+flask>=3.0
+requests>=2.32
+redis>=5.0
+opentelemetry-distro
+opentelemetry-exporter-otlp-proto-http
+opentelemetry-instrumentation-flask
+opentelemetry-instrumentation-requests
+opentelemetry-instrumentation-redis
+opentelemetry-instrumentation-logging
+cloudwatch-plugin-otel>=0.1.1
